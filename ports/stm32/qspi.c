@@ -34,8 +34,6 @@
 
 #if defined(MICROPY_HW_QSPIFLASH_SIZE_BITS_LOG2)
 
-#define QSPI_MAP_ADDR (0x90000000)
-
 #ifndef MICROPY_HW_QSPI_PRESCALER
 #define MICROPY_HW_QSPI_PRESCALER       3  // F_CLK = F_AHB/3 (72MHz when CPU is 216MHz)
 #endif
@@ -172,7 +170,26 @@ void qspi_memory_map(void) {
     qspi_mpu_enable_mapped();
 }
 
-static int qspi_ioctl(void *self_in, uint32_t cmd) {
+void qspi_memory_map_exit(void) {
+    // Prevent access to QSPI memory-mapped region.
+    qspi_mpu_disable_all();
+
+    // Abort any ongoing transfer if peripheral is busy
+    if (QUADSPI->SR & QUADSPI_SR_BUSY) {
+        QUADSPI->CR |= QUADSPI_CR_ABORT;
+        while (QUADSPI->CR & QUADSPI_CR_ABORT) {
+        }
+    }
+}
+
+// Needed on F7 due to errata 2.4.3: "Memory-mapped read operations may fail when timeout counter is enabled".
+// Call this function to disable then re-enable memory-mapped mode, which resets the CS pin to inactive.
+void qspi_memory_map_restart(void) {
+    qspi_memory_map_exit();
+    qspi_memory_map();
+}
+
+static int qspi_ioctl(void *self_in, uint32_t cmd, uintptr_t arg) {
     (void)self_in;
     switch (cmd) {
         case MP_QSPI_IOCTL_INIT:
@@ -180,18 +197,20 @@ static int qspi_ioctl(void *self_in, uint32_t cmd) {
             break;
         case MP_QSPI_IOCTL_BUS_ACQUIRE:
             // Disable memory-mapped region during bus access
-            qspi_mpu_disable_all();
-            // Abort any ongoing transfer if peripheral is busy
-            if (QUADSPI->SR & QUADSPI_SR_BUSY) {
-                QUADSPI->CR |= QUADSPI_CR_ABORT;
-                while (QUADSPI->CR & QUADSPI_CR_ABORT) {
-                }
-            }
+            qspi_memory_map_exit();
             break;
         case MP_QSPI_IOCTL_BUS_RELEASE:
             // Switch to memory-map mode when bus is idle
             qspi_memory_map();
             break;
+        case MP_QSPI_IOCTL_MEMORY_MODIFIED: {
+            uintptr_t *addr_len = (uintptr_t *)arg;
+            volatile void *addr = (volatile void *)(QSPI_MAP_ADDR + addr_len[0]);
+            size_t len = addr_len[1];
+            SCB_InvalidateICache_by_Addr(addr, len);
+            SCB_InvalidateDCache_by_Addr(addr, len);
+            break;
+        }
     }
     return 0; // success
 }
